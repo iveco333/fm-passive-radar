@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# 生成的数据/报告(可再生)
+*.dat
+pr_report_*.md
+adsb_*.json
+!adsb_fresh.json
+fm_rsp1_*.dat
+
+# 一次性调试脚本
+check_*.py
+quick_analyze.py
+analyze_pi.py
+
+# 过程性结果图(保留精选的到 results/)
+pi_result*.png
+pi_916_g15.png
+pi_new_result.png
+pi_orig_*.png
+pi_final.png
+
+# 临时
+_check_cred.ps1

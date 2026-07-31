@@ -1,0 +1,5 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+soundfile>=0.12   # 读 SDRuno WAV 文件
+# soapysdr>=0.3  # 实时采集用（可选），需额外装 SoapySDRPlay3 driver
