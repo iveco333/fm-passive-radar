@@ -141,6 +141,72 @@ class sdrplay_api_RspDxTunerParamsT(Structure):
     _fields_ = [("dummy", c_ubyte)]
 
 
+# ---- DevParamsT 系列 (sdrplay_api_dev.h v3.07) ----
+# 采样率就在这里: devParams->fsFreq.fsHz (默认 2.0M)
+class sdrplay_api_FsFreqT(Structure):
+    _fields_ = [
+        ("fsHz",       c_double),   # default: 2000000.0
+        ("syncUpdate", c_ubyte),
+        ("reCal",      c_ubyte),
+    ]
+
+
+class sdrplay_api_SyncUpdateT(Structure):
+    _fields_ = [
+        ("sampleNum", c_uint),
+        ("period",    c_uint),
+    ]
+
+
+class sdrplay_api_ResetFlagsT(Structure):
+    _fields_ = [
+        ("resetGainUpdate", c_ubyte),
+        ("resetRfUpdate",   c_ubyte),
+        ("resetFsUpdate",   c_ubyte),
+    ]
+
+
+class sdrplay_api_Rsp1aParamsT(Structure):
+    _fields_ = [
+        ("rfNotchEnable",    c_ubyte),
+        ("rfDabNotchEnable", c_ubyte),
+    ]
+
+
+class sdrplay_api_Rsp2ParamsT(Structure):
+    _fields_ = [("extRefOutputEn", c_ubyte)]
+
+
+class sdrplay_api_RspDuoParamsT(Structure):
+    _fields_ = [("extRefOutputEn", c_int)]
+
+
+class sdrplay_api_RspDxParamsT(Structure):
+    _fields_ = [
+        ("hdrEnable",       c_ubyte),
+        ("biasTEnable",     c_ubyte),
+        ("antennaSel",      c_int),   # enum
+        ("rfNotchEnable",   c_ubyte),
+        ("rfDabNotchEnable", c_ubyte),
+    ]
+
+
+class sdrplay_api_DevParamsT(Structure):
+    _fields_ = [
+        ("ppm",          c_double),   # default 0.0
+        ("fsFreq",       sdrplay_api_FsFreqT),
+        ("syncUpdate",   sdrplay_api_SyncUpdateT),
+        ("resetFlags",   sdrplay_api_ResetFlagsT),
+        ("mode",         c_int),      # enum TransferModeT: ISOCH=0, BULK=1
+        ("samplesPerPkt", c_uint),   # output param
+        ("rsp1aParams",  sdrplay_api_Rsp1aParamsT),
+        ("rsp2Params",   sdrplay_api_Rsp2ParamsT),
+        ("rspDuoParams", sdrplay_api_RspDuoParamsT),
+        ("rspDxParams",  sdrplay_api_RspDxParamsT),
+    ]
+
+
+
 class sdrplay_api_RxChannelParamsT(Structure):
     _fields_ = [
         ("tunerParams",        sdrplay_api_TunerParamsT),
@@ -165,7 +231,7 @@ class sdrplay_api_DeviceT(Structure):
 
 class sdrplay_api_DeviceParamsT(Structure):
     _fields_ = [
-        ("devParams",    c_void_p),
+        ("devParams",    POINTER(sdrplay_api_DevParamsT)),
         ("rxChannelA",   POINTER(sdrplay_api_RxChannelParamsT)),
         ("rxChannelB",   POINTER(sdrplay_api_RxChannelParamsT)),
     ]
@@ -387,7 +453,9 @@ class SDRplayAPI:
         print(f"  Freq: {freq_hz/1e6:.2f} MHz")
 
     def set_sample_rate(self, rate):
-        """Set sample rate via bandwidth selection (RSP1: no decimation)."""
+        """Set sample rate via bandwidth selection (RSP1: no decimation).
+        注意: 实测直接写 fsFreq.fsHz 会导致 API 服务崩溃 (STOP_PENDING)
+        采样率由 bwType 隐式决定: BW_1_536 → 2.375M 等硬件档位"""
         self._sample_rate = rate
         ch = self.ch
         ch.ctrlParams.decimation.enable = 0
@@ -399,12 +467,12 @@ class SDRplayAPI:
         elif rate <= 1.6e6:
             ch.tunerParams.bwType = BW_0_600
         elif rate <= 6e6:
-            ch.tunerParams.bwType = BW_1_536  # gives ~1.94 MSPS
+            ch.tunerParams.bwType = BW_1_536
         elif rate <= 8e6:
             ch.tunerParams.bwType = BW_6_000
         else:
             raise ValueError(f"Unsupported rate: {rate}")
-        print(f"  Sample rate: {rate/1e6:.2f} MHz (actual: ~{rate/1e6:.2f} depending on BW)")
+        print(f"  Sample rate: {rate/1e6:.2f} MHz (bw={ch.tunerParams.bwType}kHz, 实际由硬件档位决定)")
 
     def set_gain(self, gain_db):
         ch = self.ch

@@ -25,12 +25,12 @@ def _caf_worker_chunk(fd_chunk, ref, S, ff, max_delay, fs):
 # ========== 配置 ==========
 PI = "iveco@172.20.10.8"
 FREQ = 87.5e6
-FS = 2.0e6
-RSP1_GRDB = 20
-DURATION = 4            # 单帧: 采集4s (2s参考 + 2s监测)
+FS = 2.375e6        # 实测! Windows 直驱 BW_1_536 实际采样率 (2026-08-01 19kHz导频标定, 原 2.0e6 错导致 CAF 距离偏大18.75%/多普勒偏小18.75%)
+RSP1_GRDB = 40          # 试验: 20->40 增益提高 20dB (2026-08-02 天线位置试验后调增益对比)
+DURATION = 2            # 正式: 采集2s (1s参考 + 1s监测) - 2026-08-02实测 匹配率75% vs 4s的28%, 多普勒更准/外推更短, SNR损失可接受
 
-REF_TIME = 2.0
-SURV_TIME = 2.0
+REF_TIME = 1.0
+SURV_TIME = 1.0
 MAX_DELAY = 800
 DOPPLER_RANGE = 150
 DOPPLER_BINS = 61
@@ -40,13 +40,21 @@ MU = 0.002
 MATCH_RANGE_TOL = 5.0
 MATCH_DOPPLER_TOL = 60   # 飞机机动导致多普勒预测偏差, 放宽到60Hz
 MAX_RANGE_KM = 60      # 只保留 60km 内的峰 (FM被动雷达有效距离, 砍远距杂波)
-MIN_SNR = -6
 
 # ---- 假警抑制参数 ----
 SNR_OVER_MEDIAN = 5.0   # 峰必须比噪声中位数高 (dB): 降低让真目标进来, 靠峰形检验滤杂波
 PEAK_PROMINENCE = 3.0   # 峰必须比周围 3x3 邻域高 (dB)
 N_PEAKS_MAX = 15        # 最多保留候选峰数
 N_FRAMES = 1            # 单帧模式: 多帧在单通道FM下后段质量差, 用强阈值替代
+
+# ---- CLEAN 参数 (从 pi_pr_v5 移植, 2026-08-03) ----
+CLEAN_ITER = 40         # 迭代次数
+CLEAN_SNR_MIN = 5.0     # 峰 SNR 低于此停止 (相对噪声中位, dB)
+CLEAN_ZERO_BINS = 2     # 0Hz ±N bins 屏蔽 (直达波区)
+CLEAN_NEAR_KM = 0.5     # 近距屏蔽 (<此距离视为直达波泄漏)
+CLEAN_RIDGE = True      # 山脊核: 距离维宽核 (直达波旁瓣是距离山脊)
+CLEAN_DD_W = 1.5        # 核宽: 多普勒维 (bins)
+CLEAN_RR_W = 40.0       # 核宽: 距离维 (bins ≈ 5km) 实测: 太宽(120)会吞并近邻真目标, 40 最优
 
 RX_POS = (34.25, 108.94)
 TX_POS = (34.201, 108.954)
@@ -132,6 +140,60 @@ def _caf_multiprocess(ref, surv, dp, ff, max_delay, fs, n_workers=4):
 
 # ---- 峰值检测 (自适应阈值 + 局部峰确认) ----
 
+def clean_peaks(rd, dp, rk):
+    """CLEAN 算法 (从 pi_pr_v5 移植): 迭代找最强峰, 减掉峰+旁瓣, 直到剩下噪声
+    返回 [(range_km, doppler_hz, snr_db)] 按强度排序
+    核心: 直达波残余旁瓣是距离维山脊, 用宽距离核减掉, 让被淹没的弱目标露出来"""
+    amp = 10 ** (rd / 20.0)
+    amp_clean = amp.copy()
+    c = len(dp) // 2
+
+    # ---- 山脊模板减除 (2026-08-03): 0Hz 直达波旁瓣是距离维山脊 ----
+    # 用 0Hz ±1bin 平均剖面做模板, 按最小二乘比例从相邻多普勒行减掉
+    RIDGE_BINS = 3        # 影响范围 ±3 bins (±15Hz)
+    ridge = np.mean(amp_clean[max(0,c-1):c+2, :], axis=0)
+    ridge_norm = np.sum(ridge**2) + 1e-12
+    for di in range(max(0,c-RIDGE_BINS), min(len(dp), c+RIDGE_BINS+1)):
+        if di == c:
+            continue
+        row = amp_clean[di, :]
+        scale = np.sum(row * ridge) / ridge_norm
+        if scale > 0:
+            row -= scale * ridge
+            np.clip(row, 0, None, out=row)
+
+    # 屏蔽 0Hz 直达波区 (±CLEAN_ZERO_BINS bins) + 近距泄漏
+    amp_clean[max(0, c-CLEAN_ZERO_BINS):c+CLEAN_ZERO_BINS+1, :] = 0
+    near_bins = int(CLEAN_NEAR_KM / ((3e8/FS)/1000))
+    amp_clean[:, :near_bins] = 0
+    # 距离上限之外也屏蔽
+    max_bins = int(MAX_RANGE_KM / ((3e8/FS)/1000))
+    amp_clean[:, max_bins:] = 0
+
+    mask_pos = amp_clean > 0
+    noise_med = np.median(amp_clean[mask_pos]) if mask_pos.any() else 1e-12
+    peaks = []
+    for it in range(CLEAN_ITER):
+        idx = np.argmax(amp_clean)
+        di, ri = np.unravel_index(idx, amp_clean.shape)
+        pv = amp_clean[di, ri]
+        if pv <= 0:
+            break
+        snr = 20 * np.log10(pv / (noise_med + 1e-12))
+        if snr < CLEAN_SNR_MIN:
+            break
+        peaks.append({'range_km': float(rk[ri]), 'doppler_hz': float(dp[di]),
+                      'snr_db': float(rd[di, ri]), 'snr_clean': snr})
+        # 减掉峰 + 旁瓣形状 (山脊核: 多普勒窄, 距离宽)
+        dd = (np.arange(len(dp))[:, np.newaxis] - di) / CLEAN_DD_W
+        rr = (np.arange(len(rk))[np.newaxis, :] - ri) / CLEAN_RR_W
+        lobe = pv * np.exp(-(dd**2 + rr**2))
+        amp_clean -= lobe
+        np.clip(amp_clean, 0, None, out=amp_clean)
+    peaks.sort(key=lambda p: -p['snr_clean'])
+    return peaks
+
+
 def detect_peaks(rd, dp, rk):
     """从 CAF 幅度图检测候选峰。返回 [(range_km, doppler_hz, snr_db)]"""
     c = len(dp) // 2
@@ -198,6 +260,7 @@ def step1_adsb():
 
 def step2_rsp1():
     log("Step 2: RSP1采集FM数据")
+    time.sleep(2)  # 2026-08-02: 连续快速调用后 SDRplayAPI ServiceNotResponding, 加 2s 让 service 恢复
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     data_file = f"fm_rsp1_{ts}.dat"
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "passive_radar"))
@@ -310,7 +373,7 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
         r = _caf_multiprocess(ref_c, surv_out, dp, ff, MAX_DELAY, FS, n_workers=4)
         rd = 20 * np.log10(np.maximum(r, 1e-10))
         rd -= rd.max()
-        fp = detect_peaks(rd, dp, rk)
+        fp = clean_peaks(rd, dp, rk)   # CLEAN 替代原 detect_peaks (2026-08-03)
         log(f"  帧 {fi+1} 峰值: {len(fp)} 个")
         frame_peaks.append(fp)
 
@@ -324,12 +387,12 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
         for p in fp:
             key = (round(p['range_km'] / R_BIN), round(p['doppler_hz'] / D_BIN))
             vote[key] += 1
-            # 保留 SNR 最高的那个
-            if key not in peak_map or p['snr_db'] > peak_map[key]['snr_db']:
+            # 保留 SNR 最高的那个 (用相对噪声底的真实 SNR)
+            if key not in peak_map or p['snr_clean'] > peak_map[key]['snr_clean']:
                 peak_map[key] = p
     need = 2 if N_FRAMES > 2 else 1
     peaks = [peak_map[k] for k, v in vote.items() if v >= need]
-    peaks.sort(key=lambda p: -p['snr_db'])
+    peaks.sort(key=lambda p: -p['snr_clean'])
     peaks = peaks[:N_PEAKS_MAX]
     log(f"[5/6] 峰值(多帧确认, ≥{need}帧, 容差{R_BIN}km/{D_BIN}Hz): {len(peaks)} 个 (唯一位置 {len(vote)})")
 
@@ -424,7 +487,7 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
                 seen.append(ac['flight'])
                 matches.append({
                     'flight': ac['flight'], 'pr_range': best_peak['range_km'],
-                    'pr_doppler': best_peak['doppler_hz'], 'pr_snr': best_peak['snr_db'],
+                    'pr_doppler': best_peak['doppler_hz'], 'pr_snr': best_peak['snr_clean'],
                     'adsb_range': ac['bi_km'], 'adsb_doppler': ac['fd_hz'],
                     'range_diff': best_r_diff, 'doppler_diff': best_d_diff,
                     'rx_dist_km': ac['rx_dist_km'], 'rx_slant_km': ac['rx_slant_km'],
@@ -432,14 +495,12 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
                     'gs': ac['gs'], 'track': ac['track']
                 })
         else:
-            # 分析未匹配原因
+            # 分析未匹配原因 (SNR 不参与: CLEAN 已保证检出峰 SNR>=CLEAN_SNR_MIN)
             reasons = []
             if best_r_diff > MATCH_RANGE_TOL:
                 reasons.append(f"距离超({best_r_diff:.1f}km>{MATCH_RANGE_TOL}km)")
             if best_d_diff > MATCH_DOPPLER_TOL:
                 reasons.append(f"多普勒超({best_d_diff:.0f}Hz>{MATCH_DOPPLER_TOL}Hz)")
-            if best_peak['snr_db'] < MIN_SNR:
-                reasons.append(f"SNR低({best_peak['snr_db']:.1f}dB<{MIN_SNR}dB)")
             reason_str = ", ".join(reasons) if reasons else "未知"
             unmatched_reasons.append((ac, best_peak, best_r_diff, best_d_diff, reason_str))
 
@@ -448,7 +509,8 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
         log(f"  —— 匹配 {len(matches)} 个 ——")
         for m in matches:
             log(f"  [OK] {m['flight']}: "
-                f"PR={m['pr_range']:.1f}km/{m['pr_doppler']:+.0f}Hz({m['pr_snr']:.1f}dB) "
+                f"PR={m['pr_range']:.1f}km/{m['pr_doppler']:+.0f}Hz "
+                f"SNR={m['pr_snr']:.1f}dB "
                 f"ADS-B={m['adsb_range']:.1f}km/{m['adsb_doppler']:+.0f}Hz "
                 f"dist_d={m['range_diff']:.1f}km dop_d={m['doppler_diff']:.0f}Hz "
                 f"h_dist={m['rx_dist_km']:.1f}km brg={m['rx_bearing']:.0f}deg "
@@ -481,10 +543,10 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
         f.write(f"| 发射台 | ({TX_POS[0]:.3f}, {TX_POS[1]:.3f}) |\n")
         f.write(f"| 接收点 | ({RX_POS[0]:.3f}, {RX_POS[1]:.3f}) 基线{tx_rx_dist:.2f}km |\n")
         f.write(f"| 采集时间 | {sample_time} | ADS-B: {adsb_time or '未知'} |\n\n")
-        f.write("## PR峰值(Top20)\n\n| 距离(km) | 多普勒(Hz) | SNR(dB) |\n")
+        f.write("## PR峰值(Top20)\n\n| 距离(km) | 多普勒(Hz) | SNR相对噪声底(dB) |\n")
         f.write("|---------|-----------|--------|\n")
         for p in peaks[:20]:
-            f.write(f"| {p['range_km']:.1f} | {p['doppler_hz']:+.0f} | {p['snr_db']:.1f} |\n")
+            f.write(f"| {p['range_km']:.1f} | {p['doppler_hz']:+.0f} | {p['snr_clean']:.1f} |\n")
         f.write("\n## ADS-B\n\n| 航班 | 高度 | 速度 | 航向 | 水平距 | 斜距 | 方位 | 双基地 | 多普勒(3D) |\n")
         f.write("|-----|------|------|------|--------|------|------|-------|----------|\n")
         for ac in sorted(aircraft, key=lambda x: x['bi_km']):
@@ -494,7 +556,7 @@ def step3_process(data_file, adsb_local, adsb_time, extrap_sec=0.0):
         f.write("\n## 匹配\n\n")
         if matches:
             for m in matches:
-                f.write(f"- {m['flight']}: PR={m['pr_range']:.1f}km/{m['pr_doppler']:+.0f}Hz "
+                f.write(f"- {m['flight']}: PR={m['pr_range']:.1f}km/{m['pr_doppler']:+.0f}Hz SNR={m['pr_snr']:.1f}dB "
                         f"ADS-B={m['adsb_range']:.1f}km/{m['adsb_doppler']:+.0f}Hz "
                         f"频差{m['doppler_diff']:.0f}Hz\n")
         else:
@@ -535,7 +597,7 @@ def print_config():
     print(f"  [处理参数]  REF={REF_TIME}s MAX_DELAY={MAX_DELAY} DOPPLER=+/-{DOPPLER_RANGE}Hz/{DOPPLER_BINS}bins")
     print(f"  [CAF]        4进程并行, S提前算")
 
-    print(f"  [阈值]       MIN_SNR={MIN_SNR}dB | 匹配距离<={MATCH_RANGE_TOL}km | 多普勒<={MATCH_DOPPLER_TOL}Hz")
+    print(f"  [阈值]       CLEAN_SNR_MIN={CLEAN_SNR_MIN}dB | 匹配距离<={MATCH_RANGE_TOL}km | 多普勒<={MATCH_DOPPLER_TOL}Hz")
     print(f"  [发射台]    ({TX_POS[0]:.3f}, {TX_POS[1]:.3f})")
     print(f"  [接收点]    ({RX_POS[0]:.3f}, {RX_POS[1]:.3f})")
     print()
